@@ -46,6 +46,24 @@
   vững (persistent instruction layer), định nghĩa role, output format, và các rule không được đổi giữa
   các turn/conversation.
 
+### When to reach for each technique — chi tiết từng kỹ thuật
+
+- **System prompts** — mang "behavioral contract" cho **toàn bộ session**. Viết 1 lần, coi là
+  *persistent instruction layer*. Định nghĩa: role của Claude, output format, và mọi rule **không được
+  đổi giữa các conversation**.
+- **XML tags** — dùng khi prompt **trộn lẫn input với instruction**. Ví dụ điển hình: yêu cầu Claude
+  debug code dựa trên documentation cung cấp kèm — không có tag thì code và docs **nhìn giống hệt nhau**
+  với Claude. Bọc bằng tên tag **mô tả cụ thể** như `<my_code>` và `<docs>` → ranh giới rõ ràng. Không
+  cần dùng tên tag XML "chính thức"; tên tự đặt khớp với nội dung là tốt nhất.
+- **Few-shot examples** — hữu ích vì **cho xem (show) thay vì chỉ mô tả (tell)**. Thay vì cố tả bằng
+  lời format mong muốn, đưa **1 cặp input–output đúng** và để Claude tự suy ra pattern. Cách dùng: bọc
+  ví dụ bằng **cấu trúc XML nhất quán** (vd `<sample_input>` / `<ideal_output>`) để ranh giới ví dụ ↔
+  prompt rõ ràng. Có thể lấy luôn ví dụ từ **các output đạt điểm cao nhất trong eval** thay vì tự viết
+  mới.
+- **Output constraints** — là **tuyến phòng thủ cuối** trước khi response tới parser. Chỉ định **chính
+  xác** thứ cần: field name, type, giới hạn độ dài, có/không preamble, và **làm gì khi thiếu data**.
+  Khi format bắt buộc phải machine-readable → dùng **structured output features** (xem mục dưới).
+
 ### Structured Outputs — chuyển quyền kiểm soát output từ prompt sang API
 - **Vấn đề của cách làm bằng prompt**: mọi kỹ thuật ở trên (system prompt, XML, few-shot, output
   constraint bằng lời) đều chỉ là **yêu cầu** (request) tới model — model vẫn có thể trả về câu lạc đề,
