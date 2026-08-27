@@ -38,7 +38,12 @@
       phân ranh giới nội dung).
 - **Worked example 2 (edge case làm vỡ parser)**: extract order total từ email khách hàng để billing
   service charge tiền.
-  - **Prompt happy-path**: `Extract the order total. Return JSON: {"amount": <number>, "currency": <string>}`.
+  - **Prompt happy-path** (chỉ lo đường thẳng, chưa có rule cho variant):
+    ```
+    Extract the order total from the email. Return JSON: {"amount": <number>, "currency": <string>}.
+
+    <email>{{email_body}}</email>
+    ```
     Parser downstream: `float(data["amount"])`.
   - **Test pass hết** trên input sạch: `"Total: $49.00"` → `{"amount": 49.00, "currency": "USD"}`;
     `"120 EUR"`, `"£15.50"`... đều OK.
@@ -52,11 +57,30 @@
       billing charge $30 thay vì hoàn tiền.
   - **Chẩn đoán**: đúng hàng cuối bảng — output sạch với input đã test, vỡ với variant → thiếu
     **constraint bao phủ variant đó** (không phải lỗi wording).
-  - **Fix**: đặt tên từng variant trong constraint (số không có separator, luôn dương; thêm field
-    `direction: "charge" | "refund"`; thiếu amount thì trả `{"amount": null, "currency": null,
-    "direction": null}`). Hoặc chuyển hẳn sang **structured outputs** với JSON schema (`amount` là
-    `number` + `minimum: 0`, `direction` là `enum`, cho phép `null` tường minh) → string `"1,299.00"`
-    không thể được sinh ra.
+  - **The fix — a constraint covering each variant** (KHÔNG phải "reword the instruction" — mà là
+    **gọi tên từng variant** ra trong constraint):
+    ```
+    Extract the order total from the email.
+
+    Return ONLY this JSON, no preamble:
+    {"amount": <number>, "currency": <3-letter ISO code>, "direction": "charge" | "refund"}
+
+    Rules:
+    - amount: a plain number, no thousands separators, no currency symbol. Always positive.
+    - If the email describes a credit/refund, set direction to "refund", else "charge".
+    - If no monetary amount is present, return {"amount": null, "currency": null, "direction": null}.
+
+    <email>{{email_body}}</email>
+    ```
+    Mỗi rule vá đúng 1 variant đã làm vỡ parser ở trên:
+    - *"no thousands separators, no currency symbol, always positive"* → chặn case `"$1,299.00"` trả
+      string, và case refund trả số không dấu.
+    - *field `direction`* → tách bạch charge vs refund ngay trong shape, billing service không đoán mò.
+    - *"If no monetary amount is present → {…null}"* → định nghĩa rõ **làm gì khi thiếu data**, hết
+      tình trạng lúc bịa `0` lúc trả `null`.
+  - Hoặc chuyển hẳn sang **structured outputs** với JSON schema (`amount` là `number` + `minimum: 0`,
+    `direction` là `enum`, cho phép `null` tường minh) → string `"1,299.00"` **không thể được sinh ra**
+    ngay từ lúc decode.
 - **Khi nào stack đủ 4 kỹ thuật / khi nào đơn giản hoá / khi nào dừng lại chẩn đoán**:
   - **Stack cả 4 kỹ thuật**: task có output contract rõ ràng, nhiều edge case có thể minh hoạ bằng ví dụ.
   - **Đơn giản hoá**: task đơn giản (vd "summarize this paragraph") không cần few-shot + output schema
