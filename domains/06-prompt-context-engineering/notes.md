@@ -36,6 +36,27 @@
       cho xem hình dạng chính xác).
     - **XML tags** bọc riêng từng ví dụ, để model không hiểu nhầm ví dụ là 1 phần của instruction (=
       phân ranh giới nội dung).
+- **Worked example 2 (edge case làm vỡ parser)**: extract order total từ email khách hàng để billing
+  service charge tiền.
+  - **Prompt happy-path**: `Extract the order total. Return JSON: {"amount": <number>, "currency": <string>}`.
+    Parser downstream: `float(data["amount"])`.
+  - **Test pass hết** trên input sạch: `"Total: $49.00"` → `{"amount": 49.00, "currency": "USD"}`;
+    `"120 EUR"`, `"£15.50"`... đều OK.
+  - **Vỡ trên input lạ chưa test**:
+    - **Thousands separator**: `"Total: $1,299.00"` → Claude trả `{"amount": "1,299.00"}` (string có
+      dấu phẩy) → `float("1,299.00")` ném `ValueError`, request crash.
+    - **Không có amount** (email xác nhận giao hàng, không có giá): prompt chưa nói làm gì khi thiếu
+      data → Claude lúc thì bịa `{"amount": 0}` (charge nhầm), lúc thì `{"amount": null}` (vỡ ở dòng
+      parser khác), không nhất quán qua các lần chạy.
+    - **Refund/credit**: `"We've credited you $30.00"` → Claude trả `{"amount": 30.00}` không dấu →
+      billing charge $30 thay vì hoàn tiền.
+  - **Chẩn đoán**: đúng hàng cuối bảng — output sạch với input đã test, vỡ với variant → thiếu
+    **constraint bao phủ variant đó** (không phải lỗi wording).
+  - **Fix**: đặt tên từng variant trong constraint (số không có separator, luôn dương; thêm field
+    `direction: "charge" | "refund"`; thiếu amount thì trả `{"amount": null, "currency": null,
+    "direction": null}`). Hoặc chuyển hẳn sang **structured outputs** với JSON schema (`amount` là
+    `number` + `minimum: 0`, `direction` là `enum`, cho phép `null` tường minh) → string `"1,299.00"`
+    không thể được sinh ra.
 - **Khi nào stack đủ 4 kỹ thuật / khi nào đơn giản hoá / khi nào dừng lại chẩn đoán**:
   - **Stack cả 4 kỹ thuật**: task có output contract rõ ràng, nhiều edge case có thể minh hoạ bằng ví dụ.
   - **Đơn giản hoá**: task đơn giản (vd "summarize this paragraph") không cần few-shot + output schema
