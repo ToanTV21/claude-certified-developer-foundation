@@ -138,12 +138,61 @@
     `stop_reason` trước khi giả định response parse được.
   - **Không kết hợp được với message prefilling** — 2 pattern xung khắc trong cùng 1 request.
 
+### Extended Thinking — bật reasoning, hiệu chỉnh effort, và đọc lại kết quả cho đúng
+- **Prompting techniques** định hình *cái Claude tạo ra*. **Extended thinking** định hình *lượng công
+  việc Claude làm trước khi trả lời*. Bật lên → model viết ra reasoning từng bước trước, rồi mới đưa
+  ra câu trả lời cuối. Việc của bạn: quyết định khi nào phần công sức thêm đó đáng chi phí, và xử lý
+  đúng phần reasoning mà API trả về.
+- **Extended thinking làm gì**: model "nghĩ thành tiếng" trước khi response. Reasoning về dưới dạng 1
+  **thinking block** riêng, đứng ngay **trước** block chứa câu trả lời thật. Trên các model mới nhất,
+  **nội dung** thinking block bị **ẩn mặc định** — phải yêu cầu 1 bản tóm tắt đọc được qua **display
+  setting** mới thấy.
+- **Reasoning trên model hiện hành là adaptive**: bạn *bật* nó bằng param `thinking` (ở đâu chưa bật
+  sẵn mặc định), rồi **model tự quyết** mỗi request cần bao nhiêu reasoning. Bạn tinh chỉnh độ sâu
+  bằng **`effort` setting**, không phải bằng token budget cố định.
+  - `budget_tokens` (cách điều khiển cũ) đã **deprecated**, và trên các thế hệ model mới nhất **trả
+    lỗi 400**.
+- **Reasoning không miễn phí**: thinking token **tính phí bằng output token**. Chạy task đơn giản ở
+  effort cao = trả tiền cho độ chính xác không cần tới. Nguyên tắc giống hệt chọn tool: **match tool
+  với task** — đừng mặc định bật extended thinking, chỉ dùng có chiến lược ở nơi cần.
+
+**Khi nào dùng extended thinking**
+
+| Task shape | Gọi extended thinking? | Lý do |
+|---|---|---|
+| Multi-step reasoning giữ nhiều constraint cùng lúc: suy diễn toán học, bài logic multi-hop, lập kế hoạch chuỗi hành động phụ thuộc nhau | **Bật**, chọn `effort` khớp độ sâu bài toán | Pass reasoning là nơi model xử lý các dependency mà nếu không nó sẽ bỏ qua |
+| Task máy móc / tra cứu: classification, format conversion, extract 1 field, câu hỏi factual ngắn | **Tắt** | Extended thinking không cải thiện câu trả lời, chỉ trả thêm token vô ích. Bare prompt + output constraint mới là đúng tool |
+| Agentic loop nơi model lập kế hoạch qua nhiều tool call | **Bật**, và budget cho bước *planning* thay vì cho từng call | Reasoning trước khi lập plan giảm việc chọn nhầm tool ở downstream. Chú ý carry-back rule bên dưới |
+
+**Carry-back rule: thinking block phải trả về API nguyên vẹn**
+- Khi extended thinking bật **và** conversation có dùng **tool**: mỗi thinking block nhận được **phải
+  gửi lại API y hệt như lúc nhận** ở turn kế tiếp.
+- Mỗi block kèm 1 **signature** xác nhận reasoning không bị chỉnh sửa. Nếu bạn **sửa / tóm tắt / bỏ**
+  nó → signature không khớp → **API reject request**.
+- **Redacted thinking block** hoạt động y vậy: nội dung được mã hoá, không dành cho người đọc, nhưng
+  vẫn phải trả lại **nguyên vẹn**.
+- Đây là **yêu cầu cấu trúc**, không phải lựa chọn prompting. Lỗi hay gặp nhất: **strip thinking
+  block để tiết kiệm context** → làm hỏng request kế tiếp. Nếu lo context phình to vì reasoning tích
+  luỹ → fix bằng **context engineering** (phần sau của module này), không phải bằng cách xoá block.
+- **Forward pointer**: bài này bật reasoning + hiệu chỉnh `effort`; **không** đụng tới **model
+  selection**. Chọn *model nào để chạy* (khác với *có bật reasoning hay không*) học ở module **MSO
+  Foundations** (đứng trước module này).
+
+| | |
+|---|---|
+| **Handles well** | Task reasoning/planning khó, nơi câu trả lời sai thì đắt và token thêm mua được độ chính xác |
+| **Adds cost / complexity** | Carry-back requirement trong tool-use loop, và 1 `effort` setting giờ bạn phải tự hiệu chỉnh |
+| **Use a different approach** | Với classification / extraction / format: prompt ràng buộc tốt vừa rẻ hơn vừa chính xác ngang |
+
 ## Important APIs / Parameters
 | Name | Type | Default | Notes |
 |------|------|---------|-------|
 | `system` | str hoặc list[dict] | — | Top-level param của `messages.create()`, không nằm trong `messages` — thiết lập "hợp đồng hành vi" cho session |
 | `output_config.format` | dict | — | `{"type": "json_schema", "schema": {...}}` — ràng buộc response cuối cùng khớp JSON schema (constrained decoding); thay cho `output_format` cũ đã deprecated |
 | `strict` (trên tool definition) | bool | `False` | Set `True` để validate `tool_use.input` khớp `input_schema` trước khi code tự viết chạy — schema cần `additionalProperties: false` + `required` đầy đủ |
+| `thinking` | dict | tắt (trừ model bật sẵn) | Bật extended thinking. Trên model hiện hành reasoning là adaptive — model tự quyết lượng reasoning |
+| `effort` | str (`low`/`medium`/`high`...) | — | Tinh chỉnh độ sâu reasoning. Thay cho `budget_tokens` cũ |
+| `budget_tokens` | int | — | **Deprecated** — trên model mới nhất trả **lỗi 400**. Dùng `effort` thay thế |
 
 ## Gotchas
 - [ ] Đừng phản xạ "thêm chữ vào prompt" khi output sai — luôn **chẩn đoán loại lỗi trước** rồi mới
@@ -157,6 +206,13 @@
   `stop_reason` vì có thể là `refusal` (model từ chối) hoặc `max_tokens` (bị cắt giữa chừng).
 - [ ] `output_format` (param cũ) đã deprecated — dùng `output_config: {"format": {...}}` trên
   `messages.create()`.
+- [ ] Extended thinking: **KHÔNG** được strip/sửa/tóm tắt thinking block trong tool-use loop —
+  signature không khớp → API reject. Bỏ block để "tiết kiệm context" là lỗi kinh điển.
+- [ ] Thinking token tính phí **bằng output token** — bật extended thinking cho task máy móc
+  (classification/extract) là trả tiền thừa, không cải thiện gì.
+- [ ] `budget_tokens` deprecated, trả **lỗi 400** trên model mới nhất — hiệu chỉnh bằng `effort`.
+- [ ] Nội dung thinking block **ẩn mặc định** trên model mới — phải bật qua display setting mới đọc
+  được bản summary.
 
 ## Exam Tips
 - Đề thi có thể cho 1 mô tả failure mode (vd "output đúng nội dung nhưng sai hình dạng") và hỏi kỹ
@@ -169,6 +225,13 @@
   constrained decoding, không thể sinh ra output vi phạm schema).
 - Structured Outputs không "miễn phí" — biết đánh đổi: latency ở request đầu trên schema mới (cache
   24h), input token tăng nhẹ, và vẫn phải check `stop_reason` (`refusal`/`max_tokens`).
+- Extended thinking: đề có thể cho 1 task và hỏi có nên bật reasoning không — map theo bảng: multi-step
+  reasoning/planning → bật + chọn `effort`; classification/extraction/format → tắt, dùng prompt ràng buộc.
+- Nhớ **carry-back rule**: trong tool-use loop, thinking block (kể cả redacted) phải trả lại API
+  nguyên vẹn cùng signature — đây là câu bẫy hay hỏi. Vấn đề context phình to → giải bằng context
+  engineering, không phải xoá block.
+- Phân biệt **enable reasoning** (bài này, param `thinking` + `effort`) vs **model selection** (module
+  MSO, chọn model nào chạy) — 2 quyết định độc lập.
 
 ## Code Snippets
 ```python
