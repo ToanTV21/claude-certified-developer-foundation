@@ -184,6 +184,108 @@
 | **Adds cost / complexity** | Carry-back requirement trong tool-use loop, và 1 `effort` setting giờ bạn phải tự hiệu chỉnh |
 | **Use a different approach** | Với classification / extraction / format: prompt ràng buộc tốt vừa rẻ hơn vừa chính xác ngang |
 
+### Tool Schemas — cái Claude đọc để **chọn đúng tool**, và tool-use loop
+- **Chuyển góc nhìn**: các kỹ thuật trước định hình *ngôn ngữ Claude sinh ra*. Với tool-use, bạn
+  không lái ngôn ngữ nữa — bạn **giao 1 tập action** và tin Claude chọn đúng cái. Lựa chọn đó gần như
+  hoàn toàn do **schema bạn viết** quyết định.
+- **Hiểu lầm phổ biến nhất**: Claude **không chạy tool**. Claude đọc tool definition → quyết định tool
+  nào hợp → trả về cho app tên tool + input. **App bạn** execute tool, lấy kết quả, gửi lại; rồi Claude
+  dùng kết quả đó để tiếp tục. Ranh giới "Claude sở hữu gì / code bạn sở hữu gì" là nơi phần lớn bug
+  tool-use nằm.
+- **6 bước của loop**: (1) Define schema → (2) Send message → (3) Claude trả `tool_use` block →
+  (4) **App execute tool** → (5) App trả `tool_result` → (6) Claude tiếp tục. **Loop không tự động** —
+  bước 4 & 5 là việc code bạn phải làm. Nếu miss **có hệ thống** (systematic) → lỗi nằm ở **bước 1
+  (schema definition)**, không phải ở prompt.
+
+**Message block structure trong 1 tool-use conversation**
+- Conversation là **list các block có cấu trúc**, không phải plain text. Mỗi assistant/user turn là 1
+  list block. 4 loại block:
+
+| Block type | Role | Chứa gì | Quy tắc bắt buộc |
+|---|---|---|---|
+| `text` | Assistant | Prose của Claude | Claude có thể trả `text` **cùng turn** với `tool_use`. Khi append turn đó vào history, **giữ nguyên cả content array** (gồm cả text block). Bỏ text block → hỏng context cho turn sau |
+| `tool_use` | Assistant | Tên tool, 1 **unique ID**, input arguments | Mỗi `tool_use` phải được đáp bằng 1 `tool_result` ở **user turn ngay kế tiếp**, mang **đúng ID** đó. Thiếu → API reject request kế |
+| `tool_result` | User | `tool_use_id` khớp, nội dung kết quả, cờ `is_error: true` khi tool fail | `tool_use_id` phải khớp **chính xác** với `tool_use` gốc — Claude dùng ID này để nối kết quả về đúng call (quan trọng khi 1 turn phát nhiều tool call và kết quả về không cùng thứ tự) |
+| `thinking` | Assistant (chỉ khi extended thinking bật) | Reasoning nội bộ | Phải gửi lại API **nguyên vẹn** ở turn sau. Signature xác nhận reasoning chưa bị sửa — mọi edit/summary phá signature → API reject. Redacted thinking: cùng quy tắc, trả lại y như nhận dù nội dung mã hoá (xem [carry-back rule] ở mục Extended Thinking) |
+
+- **Invariant cốt lõi**: mọi `tool_use` block từ 1 assistant turn **phải** có `tool_result` tương ứng
+  ở **user turn ngay sau đó**. Thiếu, hoặc `tool_result` xuất hiện ở turn muộn hơn thay vì turn ngay
+  kế → **API validation error**. Đây là **cấu trúc**, không sửa được bằng cách chỉnh prompt.
+
+**Schema anatomy — 3 phần Claude đọc để ra quyết định chọn tool**
+- **`name`** — identifier ngắn, **cụ thể**. `get_account_balance` hữu ích hơn `get_data`.
+- **`description`** — phần **quyết định** chọn đúng/sai tool. Luôn viết **2 phần: khi nào dùng + khi
+  nào KHÔNG dùng**. "use this to find information" → chọn sai vì không phân biệt được với bất kỳ tool
+  retrieve nào khác. "retrieve the current balance for a specific account ID, do not use for
+  transaction history" → cho Claude 1 **exclusion condition** để làm việc.
+- **`input_schema`** — định nghĩa params bằng **JSON Schema**. Mark `required` khi Claude **bắt buộc**
+  phải có để gọi đúng; để optional khi tool chạy được mà không cần. **Overlapping parameter types
+  giữa các tool là nguồn gây sai-tool phổ biến nhất.**
+
+**Decision table — 5 lựa chọn thiết kế schema**
+
+| Quyết định | Cách xử lý | Vì sao quan trọng |
+|---|---|---|
+| **Subtask dependency** | Output tool A feed vào tool B → **chạy tuần tự** (call B không dựng được cho tới khi có kết quả A) → model hoá thành **turn riêng biệt**. Subtask độc lập → để Claude phát nhiều `tool_use` trong **1 turn**, code chạy song song | Đây là quyết định **duy nhất** đổi cách thiết kế schema. Model hiện hành **mặc định parallel** khi call độc lập. Dùng `disable_parallel_tool_use: true` để ép 1 call/turn khi cần |
+| **Required fields** | Mark `required` **chỉ khi** call vô nghĩa nếu thiếu. Đặt trong mảng `required` của input schema | Mark tất cả là required → ép Claude **bịa giá trị** cho field nó không có cơ sở điền |
+| **Optional fields** | Param có default hợp lý, hoặc absence mang ý nghĩa → **để ngoài** `required`, cho default trong function signature | Optional field cho Claude **bỏ qua** thông tin nó không có, thay vì đoán |
+| **Description length** | **3–4 câu/tool**: tool làm gì, khi nào Claude nên với tới, trả về gì. Kèm ví dụ input hợp lệ khi format quan trọng | Quá ngắn → Claude đoán vì thiếu tín hiệu phân biệt. Quá dài → trigger condition bị chôn dưới chi tiết Claude không đọc lúc quyết định |
+| **Overlapping parameter types** | 2 tool nhận cùng shape param → thêm câu **disambiguating** vào mỗi description, nêu rõ domain/trigger mà tool đó nhắm tới | Claude route theo **name + description**, param type chỉ là tín hiệu phụ. Signature giống nhau → route sụp về **chỉ còn description** |
+
+**Worked example — schema gây chọn sai tool và cách fix** *(ví dụ minh hoạ, không phải hệ production thật)*
+- Dev đăng ký 2 tool: `search_knowledge_base` và `get_cached_result`. Tên khác nhau nhưng **cả 2
+  description đều mở đầu "use this to find information"** → Claude chọn sai thường xuyên trên input mơ hồ.
+- **Nguyên nhân**: 2 description **nhìn giống hệt** tại điểm ra quyết định. Tên tool phân biệt không đủ
+  — Claude cân description nặng hơn.
+- **Fix** = thêm 1 câu exclusion/điều kiện cho mỗi cái:
+  - `search_knowledge_base`: *"Use this to search the knowledge base when the user asks a question
+    that requires looking up current information. Do not use this if the result of a prior search in
+    this session already covers the question."*
+  - `get_cached_result`: *"Use this to retrieve a result that was already fetched during this session.
+    Only use this if search_knowledge_base was called earlier in this conversation for the same query."*
+- **Cảnh báo**: exclusion condition dựa trên **toàn bộ conversation history được truyền mỗi request**.
+  Nếu turn trước bị truncate/drop → Claude không đánh giá được → **exclusion logic fail âm thầm**.
+- **Poor fit**: 2 tool làm việc na ná nhau, cần description dài mãi để tách → **gộp thành 1 tool có
+  param `type`** thay vì cố phân biệt.
+
+**MCP — thay thế cho việc tự viết schema thủ công**
+- Mọi thứ trên giả định **bạn tự viết** name/description/input_schema + function execute. **MCP
+  (Model Context Protocol)** = lớp giao tiếp chuẩn hoá, đưa tool definition + execution **ra khỏi
+  code app**, vào **dedicated server**. Có MCP server cho service bạn cần → connect thẳng, khỏi tự build.
+- **Ví dụ GitHub**: tự build đầy đủ = viết schema + execute function cho từng repo/PR/issue/project và
+  maintain khi API GitHub đổi. MCP server GitHub **đã làm sẵn** → app connect, nhận full tool list,
+  Claude chọn bằng **đúng cơ chế description-based routing** ở trên. Cơ chế y hệt — chỉ khác **ai viết
+  và ai sở hữu** tool definition.
+- **Loop không đổi khi thêm MCP**: Claude vẫn phát `tool_use`, app vẫn execute + trả `tool_result`,
+  quy tắc pairing block vẫn áp dụng. Khác **duy nhất ở bước setup**: client gửi `ListToolsRequest` →
+  server trả full tool list → pass vào Claude. Với Claude, các tool đó **không phân biệt được** với
+  tool bạn tự viết.
+- **Chi phí context**: MCP server **thêm tool definition vào context window kể cả khi không dùng** ở
+  turn hiện tại. Connect nhiều server cùng lúc → tool definition ăn budget **trước cả message đầu
+  tiên**. Kỷ luật: chỉ register server đang thực sự dùng.
+- **API MCP Connector** — kiểm soát chi phí load qua object `mcp_toolset` trong mảng `tools`:
+  - `mcp_toolset` mang block `default_config` (áp cho mọi tool trên server) + `configs` keyed theo tên
+    tool để override từng tool.
+  - `defer_loading` (bool, trong `default_config` hoặc per-tool) — **hoãn load** tool definition tới
+    khi model cần → giảm chi phí context upfront khi server có tool list lớn.
+  - `enabled` (bool) — bật/tắt từng tool → register server nhưng chỉ expose tool muốn model thấy
+    (allowlist/denylist per server).
+  - Cần **beta header `mcp-client-2025-11-20`** trên request, nếu không `mcp_toolset` config **không
+    áp dụng**.
+- **2 transport**: **local server → stdio** (app spawn server làm subprocess, giao tiếp qua stdin/
+  stdout). **Remote server → Streamable HTTP** (POST cho client→server, optional GET-based SSE stream
+  cho server→client). SSE-only cũ đã **deprecated** — integration mới dùng Streamable HTTP.
+- **Ràng buộc quan trọng**: **API MCP Connector chỉ hỗ trợ remote (HTTP) server.** stdio server cần
+  **Claude Desktop hoặc Claude Code** làm client — không connect thẳng qua API được, phải tự quản MCP
+  client connection qua SDK.
+- **Khi nào dùng gì**:
+  - **MCP**: có server được maintain tốt, phủ đúng operation bạn cần → tự viết schema chỉ thêm việc,
+    không thêm capability.
+  - **Tự viết schema**: không có MCP server phủ use case, HOẶC cần kiểm soát chính xác **description
+    quality** (không phải scope — scope thì `MCPToolset` allowlist/denylist làm được).
+  - **Cả hai**: connect MCP để có **breadth**, rồi apply description-tuning cho các tool bạn thực sự
+    route tới. Narrow tool set (allowlist) và sharpen description là **2 lever riêng biệt** — dùng cả 2.
+
 ## Important APIs / Parameters
 | Name | Type | Default | Notes |
 |------|------|---------|-------|
@@ -193,6 +295,16 @@
 | `thinking` | dict | tắt (trừ model bật sẵn) | Bật extended thinking. Trên model hiện hành reasoning là adaptive — model tự quyết lượng reasoning |
 | `effort` | str (`low`/`medium`/`high`...) | — | Tinh chỉnh độ sâu reasoning. Thay cho `budget_tokens` cũ |
 | `budget_tokens` | int | — | **Deprecated** — trên model mới nhất trả **lỗi 400**. Dùng `effort` thay thế |
+| tool `name` | str | — | Identifier ngắn, cụ thể (`get_account_balance` > `get_data`) |
+| tool `description` | str | — | Phần quyết định routing. Viết 2 phần: **khi nào dùng + khi nào KHÔNG** (exclusion condition). 3–4 câu |
+| tool `input_schema` | dict (JSON Schema) | — | Params + mảng `required`. Overlapping param types giữa tool = nguồn sai-tool phổ biến nhất |
+| `disable_parallel_tool_use` | bool | `False` (model mặc định parallel khi call độc lập) | Set `True` ép 1 tool call/turn — dùng khi có dependency thật giữa các call |
+| `is_error` (trên `tool_result`) | bool | `False` | Set `True` khi tool execute fail, để Claude biết mà xử lý |
+| `tool_use_id` (trên `tool_result`) | str | — | Phải khớp **chính xác** ID của `tool_use` gốc; `tool_result` phải ở user turn **ngay sau** |
+| `mcp_toolset` | dict (trong mảng `tools`) | — | API MCP Connector. Có `default_config` + `configs` (keyed theo tên tool) |
+| `defer_loading` | bool | `False` | Trong `mcp_toolset` — hoãn load tool definition tới khi model cần, giảm context upfront |
+| `enabled` (trong `mcp_toolset`) | bool | `True` | Bật/tắt từng MCP tool — register server nhưng chỉ expose tool cần |
+| beta header `mcp-client-2025-11-20` | header | — | Bắt buộc để `mcp_toolset` config có hiệu lực |
 
 ## Gotchas
 - [ ] Đừng phản xạ "thêm chữ vào prompt" khi output sai — luôn **chẩn đoán loại lỗi trước** rồi mới
@@ -213,6 +325,26 @@
 - [ ] `budget_tokens` deprecated, trả **lỗi 400** trên model mới nhất — hiệu chỉnh bằng `effort`.
 - [ ] Nội dung thinking block **ẩn mặc định** trên model mới — phải bật qua display setting mới đọc
   được bản summary.
+- [ ] Tool-use: **Claude không chạy tool**. App bạn execute (bước 4) + trả `tool_result` (bước 5) —
+  loop **không tự động**. Miss có hệ thống → sửa ở **schema definition**, không phải prompt.
+- [ ] Mỗi `tool_use` phải có `tool_result` khớp ID ở **user turn ngay kế tiếp** — thiếu / sai thứ tự
+  / để turn muộn hơn → **API validation error**. Không fix được bằng prompt.
+- [ ] Khi Claude trả `text` **cùng turn** với `tool_use` — append **cả content array** vào history,
+  đừng drop text block.
+- [ ] Description "use this to find information" → chọn sai tool. Luôn viết **khi nào dùng + khi nào
+  KHÔNG dùng**. Overlapping param types = nguồn sai-tool #1.
+- [ ] 2 tool na ná nhau + description dài mãi để tách → **gộp thành 1 tool có param `type`**.
+- [ ] Exclusion condition trong description dựa vào **full conversation history mỗi request** — turn
+  bị truncate → logic fail **âm thầm**.
+- [ ] Mark **mọi** field là `required` → ép Claude bịa giá trị. Chỉ mark required khi call vô nghĩa
+  nếu thiếu.
+- [ ] Model hiện hành **mặc định parallel tool call** khi call độc lập. Có dependency thật → model
+  hoá thành turn riêng, hoặc `disable_parallel_tool_use: true`.
+- [ ] MCP server **ăn context window kể cả khi tool không dùng** — chỉ register server đang thực sự
+  cần. Kiểm soát bằng `defer_loading` / `enabled` trong `mcp_toolset` (+ beta header `mcp-client-2025-11-20`).
+- [ ] **API MCP Connector chỉ hỗ trợ remote HTTP server.** stdio (local) server cần Claude Desktop
+  hoặc Claude Code làm client, không connect thẳng qua API.
+- [ ] MCP transport: integration mới dùng **Streamable HTTP**; SSE-only cũ đã **deprecated**.
 
 ## Exam Tips
 - Đề thi có thể cho 1 mô tả failure mode (vd "output đúng nội dung nhưng sai hình dạng") và hỏi kỹ
@@ -232,6 +364,18 @@
   engineering, không phải xoá block.
 - Phân biệt **enable reasoning** (bài này, param `thinking` + `effort`) vs **model selection** (module
   MSO, chọn model nào chạy) — 2 quyết định độc lập.
+- Tool-use loop 6 bước: nếu đề hỏi "Claude gọi tool nhưng không có gì xảy ra / loop treo" → nguyên
+  nhân là **app không execute + trả `tool_result`** (bước 4–5), không phải lỗi model.
+- "Claude chọn sai tool có hệ thống" → fix ở **schema `description`** (thêm exclusion condition), KHÔNG
+  phải đổi prompt, KHÔNG phải thêm câu "hãy chọn cẩn thận".
+- Câu hỏi "khi nào chạy tool song song": model **mặc định parallel khi call độc lập**; chỉ tuần tự
+  khi output tool này feed vào tool kia → khi đó model hoá thành **turn riêng biệt**.
+- MCP không đổi tool-use loop — chỉ đổi **bước setup** (client gửi `ListToolsRequest` thay vì bạn
+  register schema tự viết). Pairing rule `tool_use`↔`tool_result` vẫn nguyên.
+- Bẫy MCP: (1) API MCP Connector **chỉ remote HTTP**, stdio cần Claude Desktop/Code; (2) mỗi server
+  **ăn context kể cả tool không dùng** → `defer_loading` / `enabled` + beta header `mcp-client-2025-11-20`.
+- Phân biệt 2 lever kiểm soát tool khi dùng MCP: **allowlist/denylist (`MCPToolset`)** = thu hẹp
+  *scope*; **description tuning** = tăng *precision routing*. Dùng cả hai, không thay thế nhau.
 
 ## Code Snippets
 ```python
@@ -273,6 +417,42 @@ BOOK_FLIGHT_TOOL = {
         "additionalProperties": False,
     },
 }
+```
+
+```python
+# Tool schema: name + description (2 phần: khi nào dùng / khi nào KHÔNG) + input_schema
+SEARCH_KB_TOOL = {
+    "name": "search_knowledge_base",
+    "description": (
+        "Use this to search the knowledge base when the user asks a question that "
+        "requires looking up current information. "
+        "Do not use this if a prior search in this session already covers the question."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {"query": {"type": "string"}},
+        "required": ["query"],  # chỉ mark required cái mà call vô nghĩa nếu thiếu
+    },
+}
+
+# Tool-use loop tối giản — app (không phải Claude) execute tool rồi trả tool_result
+messages = [{"role": "user", "content": "What's our refund policy?"}]
+resp = client.messages.create(model=MODEL_DEV, max_tokens=500,
+                              tools=[SEARCH_KB_TOOL], messages=messages)
+if resp.stop_reason == "tool_use":
+    messages.append({"role": "assistant", "content": resp.content})  # giữ NGUYÊN cả content array
+    tool_results = []
+    for block in resp.content:
+        if block.type == "tool_use":
+            result = run_search(block.input["query"])  # code CỦA BẠN chạy tool
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,      # phải khớp CHÍNH XÁC id của tool_use
+                "content": result,
+            })
+    messages.append({"role": "user", "content": tool_results})  # user turn NGAY sau
+    resp = client.messages.create(model=MODEL_DEV, max_tokens=500,
+                                  tools=[SEARCH_KB_TOOL], messages=messages)
 ```
 
 ## Questions / Unclear Points
