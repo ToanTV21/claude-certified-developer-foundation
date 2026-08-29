@@ -1,7 +1,7 @@
 # Domain 6: Prompt and Context Engineering (11.0%)
 
 ## Skills trong domain này (theo exam blueprint)
-- [ ] Context Engineering (3.8%) — context window management, prevention of context drift/bloat (tool output pruning, compaction), context isolation qua subagents/multi-step workflows
+- [x] Context Engineering (3.8%) — context window management, prevention of context drift/bloat (tool output pruning, compaction), context isolation qua subagents/multi-step workflows
 - [ ] Prompt Engineering (4.6%) — instruction clarity, few-shot examples, system vs. user placement, output constraints, prompt/instruction placement across components, iterative refinement, prompt adjustment, input sanitization
 - [ ] Output Handling (2.6%) — structured output patterns, response validation, defensive parsing, skepticism toward confident output
 
@@ -286,6 +286,116 @@
   - **Cả hai**: connect MCP để có **breadth**, rồi apply description-tuning cho các tool bạn thực sự
     route tới. Narrow tool set (allowlist) và sharpen description là **2 lever riêng biệt** — dùng cả 2.
 
+### Model Selection & Context Window Budget — nền của mọi quyết định context engineering
+- **1 lựa chọn sớm nhất**: model nào chạy workload. Model quyết định **sàn** về cost + latency +
+  capability mà mọi quyết định sau đó chỉ xoay trong phạm vi đó.
+- **4 tier hiện hành**: **Fable** (mạnh nhất — reasoning phức tạp, advanced coding, research synthesis,
+  agentic workflow cần intelligence tối đa) → **Opus** (việc nặng vượt envelope của Sonnet) →
+  **Sonnet** (default cân bằng cho hầu hết production workload) → **Haiku** (tối ưu speed + cost cho
+  task nằm trong capability envelope của nó). Luôn xác nhận lineup + model ID với `platform.claude.com/docs`
+  tại thời điểm build.
+- **Quy tắc di chuyển model = phải là quyết định có đo lường (measured), không phải cảm tính**:
+  - Bắt đầu ở **Sonnet**.
+  - Lên **Opus** *chỉ khi* eval set cho thấy Sonnet không đạt chất lượng cần.
+  - Xuống **Haiku** *chỉ khi* eval set cho thấy mức regression chất lượng **chấp nhận được cho task
+    đó** — không phải chỉ vì muốn tiết kiệm cost.
+- **Phân biệt với domain này**: *chọn model nào* học ở module **MSO (Model Selection & Optimization)**.
+  Domain 06 lo phần *sau khi model đã chốt*: quản lý **context window**. (Đây cũng là phân biệt với
+  Extended Thinking: bật reasoning ≠ chọn model.)
+
+**Context window không phải tài nguyên miễn phí**
+- Context window = toàn bộ text model nhận vào 1 lúc: prompt + conversation so far + **mọi tool result**.
+  Mỗi tool result Claude trả về **được append vào context window và nằm đó tới hết session**.
+- Single-turn: không thấy. Multi-step agent chạy 10–20 tool call: window đầy nhanh. Đầy rồi → agent
+  hoặc **compact** (mất chi tiết) hoặc **stall** trước khi xong task.
+- **API xử lý thế nào khi vượt** (không im lặng cắt content cũ):
+  - Request **đã lớn hơn** context window → Messages API **reject bằng validation error trước khi
+    generate**.
+  - Request vừa, nhưng generation **chạm trần giữa chừng** → model hiện hành trả về **phần output đã
+    sinh** kèm `stop_reason: "model_context_window_exceeded"`.
+  - Muốn session chạy tiếp quá giới hạn → **app tự phải** trim / summarize history **trước** request kế.
+- **Vì sao dev không thấy, production mới vỡ**: test input nhỏ + session ngắn → window hiếm khi đầy.
+  Production: tool output thường **dài gấp 3–5 lần** test fixture, session nhiều turn hơn → window đầy
+  ở **turn 8** thay vì turn 50. Chi phí của việc không plan trước = **production outage**.
+
+**4 strategy giữ session trong budget** (mỗi token trong window = tốn tiền input + tăng latency; session
+dài cộng dồn cả 2)
+
+| Strategy | Làm gì | Khi nào dùng | Mất continuity gì |
+|---|---|---|---|
+| **Pruning** (jump back) | Quay lại 1 message cũ, tiếp tục từ đó, **xoá phần hội thoại sau điểm rewind** | Sau khi Claude đi vào hướng vô ích, hoặc tích luỹ debug qua lại không giúp task tiếp theo | Toàn bộ việc làm sau điểm rewind mất. Claude học được gì trong đoạn đó phải **học lại** |
+| **Compaction** (`/compact` ở Claude Code; **server-side compaction (beta)** ở API — platform tự làm khi config trên request; manual summarization là bản client-side thay thế) | Tóm tắt history thành bản cô đọng giữ key info Claude đã học. Summary tốn ít token hơn các turn gốc | Session gần trần nhưng **muốn làm tiếp cùng feature** với kiến thức Claude đã build | Chi tiết có thể mất trong lúc tóm tắt. Gì không nằm trong summary → Claude không còn thấy |
+| **Clearing** (`/clear`; new session ở API) | Bắt đầu conversation mới, context rỗng. Không gì carry forward | Task tiếp theo **hoàn toàn khác**, context cũ chỉ gây bias/confusion | Toàn bộ context session mất. Gì cần nhớ xuyên session phải để ở **nơi persistent** (vd `CLAUDE.md`) |
+| **Subagent Handoffs** | Spawn subagent trong **context window riêng biệt**, chỉ đưa task description + system prompt nó cần. Subagent làm việc → trả về **1 summary** | Subtask **đủ tự chứa để delegate**, đặc biệt việc exploration mà hành trình làm rối main context nhưng kết quả thì ngắn | Visibility vào **cách** subagent đi tới kết luận. Các bước trung gian bị bỏ cùng context của subagent |
+
+**2 lever thêm — không quản *cái gì vào* window mà giảm *chi phí cho cái đã ở trong***
+- **Prompt caching**: lưu lại phần xử lý đã làm trên 1 **prefix ổn định** của request → request sau
+  gửi content **giống hệt tới điểm đó** dùng lại thay vì xử lý lại.
+  - Request đầu **ghi** prefix vào cache; request sau trả **1 phần nhỏ** cost gốc.
+  - Ứng viên mạnh nhất: phần **hiếm đổi qua các turn** — system prompt dài, tool definition set lớn,
+    reference document query lặp lại.
+  - Bật bằng cách đánh dấu **cache breakpoint**: field `cache_control` type `ephemeral` trên **block
+    cuối cùng** muốn cache. Tối đa **4 breakpoint**.
+  - Multi-turn session có system prompt + tool schema ổn định → cache prefix đó 1 lần rồi reuse xuyên
+    turn = **giảm cost đòn bẩy cao nhất** có sẵn.
+- **Token counting**: đo **context pressure trước khi** request đi ra, thay vì sau khi nó fail.
+  - Endpoint `count_tokens` nhận **cùng request body** như `messages` call, trả **token count** mà
+    **không chạy inference**.
+  - Dùng lúc dev: verify giả định context budget đúng với **tool output thật**, không chỉ test fixture.
+  - Dùng ở production: **gate** request sẽ vượt window **trước khi** nó error.
+
+**Compaction sâu hơn — cái gì được giữ tuỳ cách viết summarizer**
+- `/compact` ở Claude Code: tool tự quyết cái gì vào summary.
+- API: strategy chính documented = **server-side compaction (beta)** — platform tóm tắt cho bạn khi
+  được config trên request.
+- **Manual compaction** ở API session: **bạn tự viết prompt summarizer**. Prompt đó quyết định agent
+  biết gì ở các turn sau.
+  - Yếu: *"summarize the conversation so far"*
+  - Mạnh: *"summarize the conversation, preserving all file paths modified, all decisions made, and
+    any errors encountered and their resolutions"*
+  - **Task-critical state loss vì summarizer viết sơ sài là 1 trong các nguồn failure phổ biến nhất
+    của multi-session agent** — không phải edge case.
+
+**Subagent handoffs — quản long-horizon task**
+- Task quá lớn cho 1 context window → **tăng window KHÔNG phải giải pháp**. Giải pháp = **decompose**
+  và chỉ pass context liên quan cho mỗi subagent.
+- 1 subagent nhận: **scoped task** + **minimum context nó cần** + **kết quả các bước trước trực tiếp
+  liên quan** + **tools nó cần** + **exit condition rõ ràng**. Parent agent thu kết quả.
+- Pattern này giữ **per-turn cost thấp** và làm long-horizon task **tractable**.
+- Như compaction/pruning, subagent handoff **thêm implementation overhead** → chỉ dùng nơi context
+  cost là **ràng buộc thật**. Single-turn prompt / short workflow **không cần**.
+  - **Handles well**: multi-step agent session vượt token budget, cần decompose. Thiết kế tốt nhất ở
+    **giai đoạn kiến trúc**, không phải vá lúc production.
+  - **Dùng cách khác**: pipeline không bao giờ gần giới hạn window. **Đo token usage thật** so với
+    context limit của model **trước khi** thêm overhead quản lý.
+
+**RAG — 3 chỗ 1 retrieval path có thể vỡ**
+- **Chunking** (đơn vị context truy xuất được là gì): chia **quá nhỏ** → 1 chunk thiếu context xung
+  quanh để hữu ích. Chia **quá lớn** → 1 chunk pha loãng match với text không liên quan. Default hợp
+  lý: **sentence-based / section-based + 1 chút overlap**. Overlap quan trọng vì fact **vắt qua ranh
+  giới** nếu không sẽ bị tách rời và khó retrieve.
+- **Embedding match** (chunk nào được trả về): dùng **similarity search** → lấy content **semantically
+  close**, **không phải luôn** cái chứa đúng term cần. Query 1 **identifier cụ thể** có thể **miss**
+  chunk đúng nếu 1 kết quả semantically similar hơn xếp trên. → Đây là lý do đôi khi chạy **lexical
+  match song song** với semantic.
+- **Assembly** (ghép chunk vào prompt): chunk retrieved phải tới model **đúng cấu trúc prompt kỳ vọng**,
+  nếu không model **trả lời từ memory thay vì từ text đã retrieve**.
+- **Fetch-once (index) vs search-across-rounds (agentic search)**:
+  - *Fetch-once*: system **reason được** — inspect được chunk nào retrieved cho 1 query, test retrieval
+    trực tiếp. Chi phí = **infrastructure**: index phải build, store, **kept in sync** khi corpus đổi,
+    và secure ở mọi nơi nó nằm.
+  - *Search-across-rounds*: bỏ infrastructure đó + bỏ staleness (model đọc file hiện tại lúc query),
+    đổi lại **tốn nhiều token + time hơn/query** và process **kém inspectable** hơn.
+  - **Chọn**: corpus reference **ổn định** + lookup đơn giản → index đáng sở hữu. Corpus **đổi liên
+    tục** hoặc câu hỏi **multi-step** → iterative search thường là system đơn giản hơn dù đắt hơn/query.
+  - Con số performance gain của single-agent agentic search so với retrieval index là **version-pinned**
+    — xác nhận với reference layer lúc build, đừng tin số trong module.
+
+**Forward pointer**: điểm mấu chốt không phải "biết cách quản pressure" mà là **không biết pressure tồn
+tại cho tới khi session vỡ**. Workload pass hết test ở dev rồi fail ở production **vì đúng 1 lý do**:
+tool output to ra, session dài ra, window từng giữ 20 turn gọn giờ đầy ở turn 8. Section sau = worked
+postmortem của 1 agent chạy ổn trên test fixture rồi chạm trần khi document thật chảy qua.
+
 ## Important APIs / Parameters
 | Name | Type | Default | Notes |
 |------|------|---------|-------|
@@ -305,6 +415,10 @@
 | `defer_loading` | bool | `False` | Trong `mcp_toolset` — hoãn load tool definition tới khi model cần, giảm context upfront |
 | `enabled` (trong `mcp_toolset`) | bool | `True` | Bật/tắt từng MCP tool — register server nhưng chỉ expose tool cần |
 | beta header `mcp-client-2025-11-20` | header | — | Bắt buộc để `mcp_toolset` config có hiệu lực |
+| `cache_control` | dict | — | `{"type": "ephemeral"}` đặt trên **block cuối** muốn cache. Tối đa **4 breakpoint**/request. Cache cho prefix ổn định (system prompt dài, tool set, reference doc) |
+| `client.messages.count_tokens(...)` | method | — | Nhận **cùng request body** như `messages.create`, trả token count **không chạy inference**. Gate request trước khi vượt window |
+| `stop_reason: "model_context_window_exceeded"` | str | — | Generation chạm trần window giữa chừng → trả phần output đã sinh. **Không** im lặng truncate content cũ |
+| server-side compaction | beta strategy (API) | — | Platform tự tóm tắt conversation khi config trên request. Manual summarization = bản client-side thay thế (bạn tự viết prompt summarizer) |
 
 ## Gotchas
 - [ ] Đừng phản xạ "thêm chữ vào prompt" khi output sai — luôn **chẩn đoán loại lỗi trước** rồi mới
@@ -345,6 +459,20 @@
 - [ ] **API MCP Connector chỉ hỗ trợ remote HTTP server.** stdio (local) server cần Claude Desktop
   hoặc Claude Code làm client, không connect thẳng qua API.
 - [ ] MCP transport: integration mới dùng **Streamable HTTP**; SSE-only cũ đã **deprecated**.
+- [ ] Model selection: **bắt đầu ở Sonnet**. Lên Opus / xuống Haiku **chỉ khi eval set** nói vậy —
+  xuống Haiku phải vì regression *chấp nhận được cho task*, KHÔNG phải chỉ để tiết kiệm cost.
+- [ ] Context window vượt → API **KHÔNG im lặng cắt content cũ**: request quá to → validation error
+  trước generate; chạm trần giữa chừng → `stop_reason: "model_context_window_exceeded"` + phần đã sinh.
+  App tự phải trim/summarize để chạy tiếp.
+- [ ] Prod tool output thường **dài gấp 3–5 lần** test fixture → window đầy ở turn 8 chứ không phải
+  turn 50. Dev pass hết không có nghĩa prod an toàn — đo bằng `count_tokens` trên output THẬT.
+- [ ] Manual compaction: summarizer viết sơ sài ("summarize the conversation") làm **mất task-critical
+  state** — phải liệt kê rõ cái cần giữ (file paths modified, decisions, errors + resolutions).
+- [ ] Task quá lớn cho context window → **decompose + subagent handoff**, KHÔNG phải "tăng window".
+- [ ] `cache_control` type `ephemeral` đặt trên **block cuối** muốn cache; tối đa **4 breakpoint**.
+- [ ] RAG vỡ ở 3 chỗ: **chunking** (nhỏ quá thiếu context / lớn quá pha loãng), **embedding match**
+  (similarity ≠ exact term → chạy lexical match song song), **assembly** (sai cấu trúc → model trả lời
+  từ memory).
 
 ## Exam Tips
 - Đề thi có thể cho 1 mô tả failure mode (vd "output đúng nội dung nhưng sai hình dạng") và hỏi kỹ
@@ -376,6 +504,19 @@
   **ăn context kể cả tool không dùng** → `defer_loading` / `enabled` + beta header `mcp-client-2025-11-20`.
 - Phân biệt 2 lever kiểm soát tool khi dùng MCP: **allowlist/denylist (`MCPToolset`)** = thu hẹp
   *scope*; **description tuning** = tăng *precision routing*. Dùng cả hai, không thay thế nhau.
+
+- Model selection: đề cho tình huống "muốn giảm cost" → đáp án đúng là **chạy eval để đo regression
+  trước**, KHÔNG phải "đổi sang Haiku ngay". Default luôn là **Sonnet**.
+- Đề hỏi "session dài chạm giới hạn window, xử lý sao" → map theo bảng 4 strategy: cùng feature giữ
+  kiến thức → **compaction**; đi nhầm hướng → **pruning**; task mới hoàn toàn → **clearing**; subtask
+  tự chứa → **subagent handoff**.
+- Bẫy: "tăng context window" **không bao giờ** là đáp án đúng cho long-horizon task — luôn là decompose.
+- `count_tokens` = **đo trước** (không inference); `stop_reason` = **phát hiện sau**. Đề có thể hỏi
+  "làm sao biết request sẽ vượt window trước khi gọi" → `count_tokens`.
+- Prompt caching: nhớ **4 breakpoint tối đa**, `cache_control: {"type": "ephemeral"}`, đặt trên **prefix
+  ổn định** (system prompt / tool schema), không phải phần đổi mỗi turn.
+- Compaction manual: câu hỏi "vì sao agent quên file đã sửa sau khi compact" → **summarizer prompt
+  under-specified**, không liệt kê state cần giữ.
 
 ## Code Snippets
 ```python
