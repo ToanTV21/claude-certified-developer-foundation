@@ -396,6 +396,117 @@ tại cho tới khi session vỡ**. Workload pass hết test ở dev rồi fail 
 tool output to ra, session dài ra, window từng giữ 20 turn gọn giờ đầy ở turn 8. Section sau = worked
 postmortem của 1 agent chạy ổn trên test fixture rồi chạm trần khi document thật chảy qua.
 
+### Building a production agent — the loop, wiring paths, orchestration, HITL
+- **Agent = 1 multi-step tool-use loop** có **managed context** + **defined goal**. Các mảnh rời (tool
+  schema, context management) đã học ở trên — section này **ghép chúng thành 1 hệ chạy được** và thêm
+  lớp mà 2 topic kia không tự có (orchestration + human-in-the-loop).
+- **Failure mode chỉ lộ khi các component chạy chung nhiều turn** (isolated test không bắt được):
+  routing đúng ở single-turn bắt đầu **cộng dồn sai** khi lặp; context đầy nhanh hơn dự tính; 1 step
+  nhận nhầm input vì tool call trước cấu trúc sai.
+- **Câu hỏi phải hỏi TRƯỚC khi build agent**: *task này có thật sự cần agent không?* Agent mang
+  coordination overhead + context cost phình + nhiều bề mặt lỗi hơn pattern đơn giản.
+
+**Workflow hay agent — quyết định trước dòng code đầu tiên**
+- Sai lầm nặng nhất trong agent dev = **chọn nhầm pattern ngay từ đầu**.
+  - Dùng **agent khi workflow là đủ** → thêm behavioral complexity mà **không thêm capability**.
+  - Dùng **workflow khi cần agent** → hệ **vỡ mỗi khi user input lệch khỏi path đã định sẵn**.
+
+| Chọn **workflow** khi… | Chọn **agent** khi… |
+|---|---|
+| Liệt kê được **chính xác các bước** bằng code | Chỉ định được **goal + tools** nhưng **không** định được path |
+| Error cost thật, cần **step-level guardrail** | Path xuyên qua công việc **không enumerate trước được** |
+| Cần **observability bằng tooling chuẩn** (operational logging) | Non-determinism chấp nhận được; action bị **giới hạn bởi registered toolset** |
+| Input **well-constrained** vào 1 tập đã biết | User input **biến thiên khó lường** về nội dung + cấu trúc |
+| Mọi lần chạy đi **cùng 1 sequence** | Task cần **creative sequencing** các tool có sẵn |
+
+- **Progression bắt buộc**: bắt đầu bằng pattern đơn giản nhất giải được bài toán — **1 API call → workflow
+  → agent**. Chỉ lên bậc khi pattern đơn giản hơn **không xử lý nổi** độ biến thiên của task. Agent là
+  **bậc cuối**, không phải mặc định.
+
+**3 wiring path — ai chạy loop, bạn gánh gì** (xếp theo mức infra bạn *nhường đi*, nhiều dần)
+
+| Path | Ai chạy loop | Bạn sở hữu / gánh gì | Chọn khi |
+|---|---|---|---|
+| **Raw Messages API loop** | **Code bạn** chạy từng iteration: send request, đọc `tool_use` block, execute tool, append `tool_result` | **Toàn bộ**: loop, tool execution, context management, retry, exit condition. Không có gì cho sẵn | Cần full control từng step; có ràng buộc mà library không đáp ứng; hoặc đang tự học loop trước khi thêm abstraction |
+| **Agent SDK** | Chạy **cùng loop đó trong process của bạn**; SDK lo cấu trúc register tool, set system prompt, iterate loop | Code bạn **vẫn tự execute tool**. Context management + parallel tool handling do SDK cấp | Muốn cấu trúc loop có sẵn nhưng vẫn in-process; workload cần ZDR/PHI (config được cover) |
+| **Claude Managed Agents** (public beta) | **Anthropic** chạy loop + sandbox server-side; app bạn stream event vào, nhận kết quả qua **SSE** | Định nghĩa agent **1 lần** như **versioned API resource** (model, system prompt, tools, MCP servers, skills), tham chiếu bằng **ID**; + 1 app layer gửi event & consume stream | Task chạy **lâu (phút–giờ)**; muốn **managed sandbox**; không muốn tự build loop+sandbox+tool-exec runtime |
+
+- **Đừng chọn path chỉ vì prototype nhanh nhất** — chọn theo **deployment + compliance constraint**.
+- **Managed Agents — cái bạn thôi sở hữu / cái bạn nhận lại**:
+  - Thôi sở hữu: iteration loop, execution sandbox, retry trong loop, tool-execution runtime,
+    long-running execution management, sandbox provisioning/teardown.
+  - Nhận lại: **agent-as-API-resource** (versioned), app layer stream event, **server-side stateful
+    session** (Anthropic lưu, theo data-handling policy của họ), phụ thuộc tool set + execution model
+    của managed sandbox, và **beta surface có thể đổi giữa các release**.
+- **Constraint chốt hạ cho regulated work**: Managed Agent session **stateful + lưu server-side** →
+  **không** eligible cho **Zero Data Retention** hay **HIPAA BAA**. Workload mang **PHI** hoặc dưới
+  **ZDR requirement** → path này **bị loại**, route sang Agent SDK / raw loop trên covered config.
+  Governing constraint chọn path **trước khi** convenience có tiếng nói.
+- **Progression thường gặp**: prototype trên **Agent SDK** local → lên **Managed Agents** cho prod.
+  Agent definition **mang theo về mặt khái niệm**, nhưng **format đổi** (SDK = code + filesystem
+  config; Managed = versioned API resource) → phải **re-express**, không phải export thẳng.
+
+**Wiring the loop — 4 bước giữ nguyên trên mọi path**
+1. **Register tools** — mỗi tool theo cùng schema structure; đăng ký để Claude biết có gì.
+2. **Set system prompt** — **scope vào đúng task của agent**. System prompt rộng → routing rộng, kém
+   tin cậy. System prompt **nêu tên task cụ thể + tools dành cho nó** → hành vi nhất quán hơn.
+3. **Handle tool-use loop** — dù bạn tự iterate hay SDK iterate, **code bạn execute**. Mọi `tool_use`
+   Claude phát ra phải được execute + trả về trong `tool_result` block. **Mọi `tool_use` từ 1
+   assistant turn phải resolve cùng nhau** trước assistant turn kế.
+4. **Define exit conditions** — loop chạy tới khi nhận **stop condition**. Không có exit condition rõ
+   → agent **cứ xin thêm tool call vượt mức task cần**. Phải tự định nghĩa *done nghĩa là done*, không
+   phụ thuộc Claude tự nguyện dừng.
+
+**Loop wiring checklist** (verify bất kể path nào)
+
+| # | Item | Verify gì |
+|---|---|---|
+| 1 | Tools registered | Mọi tool agent có thể cần đều trong list. **Không** reference tool chưa register trong system prompt |
+| 2 | System prompt scoped | Nêu task + tools có sẵn. **Không** tả tool agent không có. **Không** bỏ sót guidance scoping cho tool agent có |
+| 3 | Tool-use loop implemented | Xử lý **mọi** `tool_use` block + trả 1 `tool_result` cho từng cái trước assistant turn kế. Tất cả `tool_use` từ 1 turn resolve cùng nhau |
+| 4 | HITL insertion point defined | Ít nhất **1 điểm** trong loop có human-in-the-loop check |
+| 5 | Exit conditions defined | Có stopping criterion rõ, **không** phụ thuộc Claude tự dừng |
+
+**Human-in-the-loop (HITL) — chèn ở đâu**
+- HITL checkpoint = **pause execution → route sang human review** trước khi đi tiếp. Câu hỏi quyết định
+  chỗ chèn: *worst-case nếu step này chạy mà không có human check là gì?*
+
+| Insertion point | Trigger | Risk level |
+|---|---|---|
+| **Trước 1 destructive tool call** | Agent sắp execute write / delete / send | **High** — irreversible, gọi sai không undo được |
+| **Sau 1 planning step** | Agent đã sinh plan, sắp bắt đầu execute | **Medium** — plan sai → outcome sai dù mọi step chạy đúng |
+| **Trên unexpected output** | Tool result có error flag, empty, hoặc value ngoài bound kỳ vọng | **Variable** — bắt failure mode mà retry logic không tự giải |
+
+**Tool orchestration — over-tooling vs under-tooling**
+- Routing behavior của agent bị định hình bởi **(a) tool được mô tả thế nào** + **(b) register bao nhiêu tool**.
+- **Over-tooling** (phổ biến hơn ở prod): register mọi tool "just in case" → **selection quality tụt
+  khi tool surface phình**. Description trùng lặp → routing thất thường.
+- **Under-tooling**: quá ít tool → agent **hallucinate 1 path** hoặc trả kết quả **incomplete**.
+- **Kỷ luật**: bắt đầu bằng **tập tối thiểu** cần cho task; chỉ thêm tool khi **xác nhận 1 gap
+  capability cụ thể**.
+
+**Regulated data constraint chọn endpoint + credential TRƯỚC khi bạn wire**
+- Data có ràng buộc đặc thù (attorney-client privilege, HIPAA, GDPR/data-residency, FedRAMP, internal
+  policy) → constraint đó quyết định **code gọi endpoint nào, mang credential gì, log đổ đâu** — trước
+  mọi quyết định về prompt/tool/memory. Dev thường không chọn surface, nhưng **viết code target
+  endpoint cụ thể + attach credential + config region + emit log** → phải **nêu tên governing
+  constraint từ đầu** (sửa client config sai sau khi agent đã wire đắt hơn nhiều).
+
+| Constraint | Thường loại bỏ (trong code) | Thường qua được code review |
+|---|---|---|
+| **Attorney-client privilege** | Call từ consumer Claude.ai surface firm không audit end-to-end; gửi privileged content tới endpoint chưa được firm approve | Direct API/SDK từ trong app của firm, auth qua SSO, qua **firm-approved LLM gateway có full request/response logging**. Anthropic **không capture** conversation content mặc định trên direct API → **app layer tự log** về approved destination |
+| **HIPAA (PHI)** | Gửi PHI tới endpoint/route **không cover bởi BAA** cho đúng config đang dùng; kể cả logging/retention path chưa scope trong cùng BAA | Direct API/SDK trên **BAA-covered config** (Anthropic provision 1 HIPAA-enabled org riêng); hoặc route qua **AWS Bedrock / GCP Vertex** trên cloud account HIPAA-eligible. BAA **không** cover Console, Workbench, beta features, consumer plans |
+| **GDPR / data residency** | Route mà **region model execution không pin được trong code**; default global endpoint không chỉ định region | Route qua **Bedrock / Vertex** với **region pin trong client config** vào jurisdiction được cover. **Direct Anthropic API hiện KHÔNG có EU data residency** → dùng Bedrock/Vertex |
+| **FedRAMP / government** | Endpoint không nằm trên authorized cloud ở impact level yêu cầu; dev/test hit commercial endpoint còn prod hit authorized (credential + pattern leak giữa 2) | 3 route authorized: **Claude for Government (C4G)** (FedRAMP High qua PFCS-SS), **Bedrock GovCloud** (FedRAMP High + DoD IL4/5), **Vertex AI Assured Workloads**. Claude Enterprise trên AWS Marketplace **không** FedRAMP authorized. Verify tại `trust.anthropic.com` |
+| **Internal data-residency policy** | SDK client config chống lại cloud vendor **ngoài approved list** — kể cả khi năng lực kỹ thuật đủ. Procurement-level constraint loại code path trước khi engineering preference lên tiếng | Route trên **cloud vendor CIO đã clear**; build đúng SDK client + endpoint đó, không đổi giữa chừng vì route khác "trông dễ hơn" |
+
+- **SOC 2 không thuộc phạm vi này** — nó quản *cách hệ thống được build/vận hành*, không quản *code gọi
+  endpoint nào* (học ở Module 4 cùng security posture / audit).
+- **Forward pointer**: Module 4 (Production Engineering, Evals & Security) đi sâu secure-by-design cho
+  IAM/privacy, defense chống prompt injection từ untrusted input, runtime guardrail, agent hardening.
+  Section này chỉ **surface constraint đúng chỗ nó loại option** = lúc chọn endpoint + SDK client
+  config + credential.
+
 ## Important APIs / Parameters
 | Name | Type | Default | Notes |
 |------|------|---------|-------|
@@ -419,6 +530,10 @@ postmortem của 1 agent chạy ổn trên test fixture rồi chạm trần khi 
 | `client.messages.count_tokens(...)` | method | — | Nhận **cùng request body** như `messages.create`, trả token count **không chạy inference**. Gate request trước khi vượt window |
 | `stop_reason: "model_context_window_exceeded"` | str | — | Generation chạm trần window giữa chừng → trả phần output đã sinh. **Không** im lặng truncate content cũ |
 | server-side compaction | beta strategy (API) | — | Platform tự tóm tắt conversation khi config trên request. Manual summarization = bản client-side thay thế (bạn tự viết prompt summarizer) |
+| Managed Agents — agent definition | versioned API resource | — | Định nghĩa 1 lần (model, system prompt, tools, MCP servers, skills), tham chiếu bằng **ID**; app gửi user event, nhận kết quả qua **SSE**. Anthropic chạy loop + sandbox server-side |
+| Managed Agents session | stateful, server-side | — | Anthropic lưu → **KHÔNG** eligible ZDR / HIPAA BAA. PHI/ZDR workload → dùng Agent SDK / raw loop trên covered config |
+| exit condition (agent loop) | design choice | — | Loop chạy tới khi có stop condition; **không** phụ thuộc Claude tự nguyện dừng — phải tự định nghĩa *done* |
+| HITL checkpoint | design choice | — | Pause execution → human review. Chèn: trước destructive tool call (high), sau planning step (medium), trên unexpected output (variable) |
 
 ## Gotchas
 - [ ] Đừng phản xạ "thêm chữ vào prompt" khi output sai — luôn **chẩn đoán loại lỗi trước** rồi mới
@@ -473,6 +588,27 @@ postmortem của 1 agent chạy ổn trên test fixture rồi chạm trần khi 
 - [ ] RAG vỡ ở 3 chỗ: **chunking** (nhỏ quá thiếu context / lớn quá pha loãng), **embedding match**
   (similarity ≠ exact term → chạy lexical match song song), **assembly** (sai cấu trúc → model trả lời
   từ memory).
+- [ ] **Workflow vs agent**: enumerate được các bước bằng code → **workflow**; chỉ có goal + tools,
+  path không định trước → **agent**. Dùng agent khi workflow đủ = thêm complexity không thêm capability.
+  Progression: **1 API call → workflow → agent**, agent là bậc cuối.
+- [ ] **3 wiring path**: raw Messages API loop (bạn gánh hết) / Agent SDK (loop có sẵn, in-process,
+  bạn vẫn tự execute tool) / Managed Agents (Anthropic chạy loop + sandbox, agent = versioned API
+  resource, stream qua SSE). Loop 4 bước (register tools → scope system prompt → handle tool-use loop
+  → define exit conditions) **giữ nguyên trên mọi path**.
+- [ ] **Managed Agents session stateful + server-side → KHÔNG eligible ZDR / HIPAA BAA**. PHI hoặc ZDR
+  requirement → loại path này, route Agent SDK / raw loop trên covered config. Governing constraint
+  chọn path trước convenience.
+- [ ] Agent loop **không tự dừng** — không có exit condition rõ thì agent xin thêm tool call vượt mức
+  task cần. `done` phải do bạn định nghĩa.
+- [ ] **Over-tooling** (register mọi tool "just in case") là lỗi phổ biến hơn under-tooling ở prod —
+  selection quality tụt khi tool surface phình. Bắt đầu bằng tập tối thiểu, thêm khi xác nhận gap cụ thể.
+- [ ] **HITL** chèn: **trước destructive tool call** (high, irreversible) / **sau planning step**
+  (medium, plan sai → outcome sai) / **trên unexpected output** (error flag, empty, ngoài bound).
+- [ ] **Regulated data constraint chọn endpoint + credential TRƯỚC khi wire**: GDPR/data-residency →
+  Bedrock/Vertex với region pin (direct Anthropic API **không có EU residency**); HIPAA → BAA-covered
+  config (không cover Console/Workbench/beta/consumer); FedRAMP → C4G / Bedrock GovCloud / Vertex
+  Assured Workloads (Claude Enterprise trên AWS Marketplace **không** FedRAMP). **SOC 2 không thuộc
+  phạm vi chọn endpoint**.
 
 ## Exam Tips
 - Đề thi có thể cho 1 mô tả failure mode (vd "output đúng nội dung nhưng sai hình dạng") và hỏi kỹ
@@ -517,6 +653,20 @@ postmortem của 1 agent chạy ổn trên test fixture rồi chạm trần khi 
   ổn định** (system prompt / tool schema), không phải phần đổi mỗi turn.
 - Compaction manual: câu hỏi "vì sao agent quên file đã sửa sau khi compact" → **summarizer prompt
   under-specified**, không liệt kê state cần giữ.
+- **Workflow vs agent**: đề cho tình huống ("mọi lần chạy cùng sequence" / "input well-constrained" /
+  "cần step-level guardrail" / "cần observability chuẩn") → **workflow**. ("chỉ có goal + tools" /
+  "input biến thiên khó lường" / "cần creative sequencing") → **agent**. Bẫy: chọn agent khi workflow đủ.
+- Đề hỏi "3 cách wire agent khác nhau ở điểm nào" → **1 biến duy nhất: ai chạy loop / bạn sở hữu bao
+  nhiêu infra**. Loop 4 bước không đổi. Chọn theo deployment + compliance constraint, KHÔNG theo "cái nào
+  prototype nhanh nhất".
+- Bẫy compliance: **PHI / ZDR → Managed Agents bị loại** (session stateful server-side). **EU data
+  residency → KHÔNG dùng direct Anthropic API**, phải Bedrock/Vertex region-pinned. **FedRAMP → chỉ
+  C4G / Bedrock GovCloud / Vertex Assured Workloads**.
+- Đề hỏi "chèn human-in-the-loop ở đâu" → câu quyết định là *worst-case nếu step chạy không có human
+  check*. Destructive/irreversible → trước tool call; plan sai tốn kém → sau planning step.
+- "Agent cứ gọi tool mãi không dừng" → thiếu **explicit exit condition**, không phải lỗi model.
+- "Agent routing thất thường ở prod" → thường là **over-tooling** (quá nhiều tool + description trùng),
+  fix bằng thu hẹp về tập tối thiểu, không phải thêm tool.
 
 ## Code Snippets
 ```python
