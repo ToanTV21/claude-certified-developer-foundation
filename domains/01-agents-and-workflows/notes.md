@@ -6,7 +6,7 @@
 - [ ] Agent Construction with Claude (5.3%) — Claude Agent SDK, custom agent loops/harnesses, managed deployment (self-hosted vs. Anthropic-hosted), hooks cho deterministic actions
   - Lesson này phủ **về mặt khái niệm**: 3 wiring path (raw loop / Agent SDK / Managed Agents) + 4 bước wire loop. CHƯA có hands-on SDK / hooks.
 - [x] Agent Patterns and Frameworks (4.9%) — tool-use loops, sub-agents, memory, context-window management, agentic frameworks (Strands, LangGraph, PydanticAI)
-  - Lesson này phủ: **tool-use loop**, exit conditions, over/under-tooling. CHƯA phủ: memory, Strands / LangGraph / PydanticAI.
+  - Lesson này phủ: **tool-use loop**, exit conditions, over/under-tooling, **memory scope (4 lựa chọn)**, **multi-step decomposition + planning-and-execution**, **Skills vs CLAUDE.md vs in-context**. CHƯA phủ: Strands / LangGraph / PydanticAI.
 
 ## Key Concepts
 
@@ -122,6 +122,71 @@ cụ thể + attach credential + config region + emit log** → phải **nêu t�
 - **SOC 2 không thuộc phạm vi này** — nó quản *cách hệ thống được build/vận hành*, không quản *code gọi
   endpoint nào* (học ở Module 4 cùng security posture / audit).
 
+### Agent design patterns — cùng 1 objective với memory scope
+Blueprint gom mấy pattern này chung 1 objective; các phần trước của module đã build từng cái:
+- **Tool-use loop** — model gọi tool → đọc result → chạy tiếp. Pattern lõi (đã có ở exercise 01).
+- **Multi-step task decomposition** — chẻ 1 goal thành các subtask có thứ tự.
+- **Planning-and-execution** — tách **quyết định plan** khỏi **thực thi plan**. Đúng chỗ mà HITL check
+  "sau 1 planning step" bảo vệ: plan sai → outcome sai dù mọi step chạy đúng.
+- **Memory scope** — pattern quyết định **state nào sống sót sau khi loop kết thúc**.
+
+### Memory scope — agent biết gì khi session MỚI bắt đầu
+Chọn sai có **2 failure mode kéo ngược chiều nhau**:
+- Quá nhiều state **in-context** → mọi API call phình to (model re-read full conversation mỗi turn,
+  bill scale theo độ dài session).
+- Quá ít state **in persistent storage** → agent không nhớ gì qua session; cái gì không ghi ra thì
+  biến mất khi hội thoại kết thúc.
+
+| Scope | Persist gì | Cost | Dùng khi | Mất gì |
+|---|---|---|---|---|
+| **In-context memory** | State nằm trong conversation đang chạy, sống qua các turn trong **1 session** | Zero retrieval overhead; token cost tăng dần khi hội thoại dài | Session ngắn, mọi state vừa context window, **không cần** sống qua restart | Mất **sạch** khi session kết thúc — `clear` / session mới xoá hết |
+| **External storage** (DB) | State ghi ra database, đọc lại lúc session start hoặc on-demand | Mỗi DB call thêm **retrieval latency** + phải tự viết read/write logic | State phải **sống qua nhiều session**, chuyển giữa user, hoặc share giữa nhiều agent instance | Không mất gì phía persistence; giá phải trả là latency mỗi call + implementation complexity |
+| **Summarized memory** | Bản tóm tắt cô đọng của hội thoại trước, inject vào **đầu session sau** | Token/session thấp hơn replay full history; nhưng bước summarize **làm rơi chi tiết** | Conversational agent chạy **dài**, full history sẽ vượt context budget trước khi xong | Bất kỳ chi tiết nào summarizer prompt **không giữ lại** |
+| **No persistent memory (stateless)** | Không gì cả — mỗi session độc lập | Không overhead (không có gì để retrieve/store) | Task-execution agent làm xong đóng lại; pipeline mỗi session độc lập theo thiết kế | Toàn bộ context trước đó — follow-up phụ thuộc session cũ thì bó tay |
+
+- **Chọn ở DESIGN PHASE, không phải production refactor.** Agent giúp **cùng 1 user qua nhiều ngày** →
+  cần carry state ngoài context window (summary hoặc full history) để session sau đọc lại. Agent nhận
+  **1 job, làm xong, đóng** → chạy **stateless**.
+- **Vì sao default path nguy hiểm**: lưu full history trong `messages` array, gửi mỗi API call →
+  prototype chạy ổn 1 thời gian. Rồi token cost tăng mỗi turn, latency leo khi context đầy, cuối cùng
+  session dài **đụng hard limit → agent ngừng trả lời**. Lúc đó refactor (kéo state ra external storage,
+  mỗi turn chỉ thêm cái nó cần) chỉ vài trăm dòng + 1 DB team đã có — cái **đắt là timing**: làm dưới
+  deadline production. Quyết ở design phase thì **rẻ**.
+- **Bẫy giả định hay gặp nhất**: giữ hết state in-context vì tin "window đủ lớn". Không có prompt
+  caching / compaction → session dài đội cost nhanh hơn team tưởng (họ chỉ đo turn đầu). **Đo actual
+  session token usage vs window limit TRƯỚC khi commit.**
+
+### Skills — instruction set tái sử dụng, load on-demand
+Vấn đề khác memory scope: mang **instruction lặp lại** qua nhiều task mà **không** phải inject vào mọi
+session. Pattern cho việc đó = **Skill**: 1 file markdown dạy Claude xử lý 1 loại task, **1 lần**.
+
+- Skill = file **`SKILL.md`** trong 1 thư mục được nhận diện. 2 phần: **frontmatter** (`name` +
+  `description`) + **instructions** bên dưới.
+- `description` là **tiêu chí matching**. Claude đọc name + description của **mọi** Skill available, so
+  với message; **chỉ load full instructions khi khớp**. Không khớp → không bao giờ vào context window.
+- Tương phản với in-context memory (**luôn có mặt**, lớn dần mỗi turn): Skill **chỉ load khi task cần**,
+  ở **cả** Claude Code lẫn Agent SDK.
+
+| Pattern | Load khi nào | Context cost | Tốt cho |
+|---|---|---|---|
+| **Skill (SKILL.md)** | On-demand khi request khớp `description` | **Thấp** — chỉ name + description load lúc startup; full content load khi khớp | Expertise theo task cụ thể, không nên phình session không liên quan (output format theo domain, review checklist chuyên biệt, workflow chỉ áp dụng 1 subset task) |
+| **CLAUDE.md** | **Mọi session, vô điều kiện** | Overhead **cố định** mỗi session bất kể task | Chuẩn dự án always-on (coding convention team thống nhất, format rule bắt buộc, constraint đúng với mọi task trong codebase) |
+| **In-context instructions** | Có mặt mọi turn trong session đó | Lớn dần theo độ dài session; **không** sống qua session end | Session ngắn, full history vừa window, không cần persist |
+
+- **CLAUDE.md behavior phụ thuộc môi trường**:
+  - **Claude Code CLI** → load vào **mọi session**, bất kể task.
+  - **Agent SDK** → load filesystem settings (gồm CLAUDE.md) do config **`settingSources`** kiểm soát.
+    **Đừng dựa vào default** — set explicit, verify default hiện hành với Agent SDK reference lúc build.
+- **Skills trên Messages API = beta**, config khác đường Claude Code / Agent SDK:
+  - Cần **2 beta header**: `code-execution-2025-08-25` và `skills-2025-10-02`.
+  - Skill gọi kiểu này **chạy trong code execution container**, không phải môi trường app gọi →
+    ảnh hưởng tool + filesystem access mà Skill dựa vào.
+  - Beta header có version, sẽ đổi khi tiến tới GA — check doc Anthropic hiện tại trước khi build prod.
+- **Subagent KHÔNG tự inherit Skills từ parent session** — bắt đầu clean context; **không** inherit
+  conversation history. Subagent cần Skill → phải **liệt kê explicit trong config của subagent**.
+- **NHƯNG** subagent **CÓ inherit permission context** từ parent — permission scope **không** reset khi
+  delegate. (Bẫy: "clean context" ≠ "clean permission".)
+
 ## Important APIs / Parameters
 | Name | Type | Default | Notes |
 |------|------|---------|-------|
@@ -131,6 +196,10 @@ cụ thể + attach credential + config region + emit log** → phải **nêu t�
 | `stop_reason` | str | — | Exit signal của loop: `"tool_use"` = còn lặp; `"end_turn"` / khác = agent đã trả lời cuối |
 | Agent SDK | library | — | Chạy loop **in-process**; cấp sẵn register tool / iterate / context management; **bạn vẫn tự execute tool** |
 | Managed Agents | hosted (public beta) | — | Anthropic chạy loop + sandbox; agent = **versioned API resource** (ref bằng ID); event/kết quả qua **SSE**; session stateful server-side → **không** ZDR/HIPAA-BAA |
+| `settingSources` | Agent SDK config | (verify tại build time) | Kiểm soát filesystem settings nào (gồm **CLAUDE.md**) được load trong Agent SDK. **Set explicit**, không dựa default |
+| `settings` (kèm `system` trong Claude Code CLI) | — | — | Claude Code CLI: **CLAUDE.md load vào MỌI session** vô điều kiện, không config được như SDK |
+| beta headers cho Skills | HTTP header | — | Messages API muốn dùng Skills (beta): cần **`code-execution-2025-08-25`** + **`skills-2025-10-02`**; Skill chạy trong **code execution container** |
+| `SKILL.md` | file (frontmatter + body) | — | `name` + `description` load lúc startup (rẻ); full body chỉ load khi `description` khớp request. Subagent **không** tự inherit |
 
 ## Gotchas
 - [ ] Dùng **agent khi workflow là đủ** → thêm complexity mà không thêm capability. Ngược lại: workflow khi cần agent → vỡ khi input lệch path.
@@ -141,6 +210,14 @@ cụ thể + attach credential + config region + emit log** → phải **nêu t�
 - [ ] **Direct Anthropic API hiện không có EU data residency** — GDPR residency requirement → phải qua Bedrock/Vertex với region pin.
 - [ ] Prototype Agent SDK → prod Managed Agents: agent definition **re-express**, không export thẳng (format khác nhau).
 - [ ] Over-tooling là failure phổ biến hơn under-tooling ở prod — bắt đầu tập tool tối thiểu.
+- [ ] **Memory scope quyết định ở DESIGN PHASE** — refactor lúc production (kéo state ra external storage) mechanical nhưng đắt vì timing (deadline đang chạy).
+- [ ] **In-context memory mất SẠCH khi session kết thúc** — `clear` / session mới xoá hết. Muốn nhớ qua session → external storage / summarized.
+- [ ] **Summarized memory rơi chi tiết** — chỉ giữ cái summarizer prompt chọn giữ; summarizer prompt không đặc tả tốt → state task-critical rơi mỗi lần compress.
+- [ ] **Stateless ≠ xấu** — đúng cho task-execution agent làm xong đóng lại / pipeline session độc lập.
+- [ ] **CLAUDE.md: Claude Code CLI load mọi session; Agent SDK do `settingSources` quyết** — đừng dựa default.
+- [ ] **Skill load on-demand khi `description` khớp** — chỉ name+description tốn context lúc startup. Khác CLAUDE.md (luôn load) và in-context (lớn dần mỗi turn).
+- [ ] **Subagent KHÔNG inherit Skills / conversation history** từ parent, NHƯNG **CÓ inherit permission context** (scope không reset khi delegate).
+- [ ] **Skills trên Messages API = beta**: cần header `code-execution-2025-08-25` + `skills-2025-10-02`; chạy trong code execution container (không phải môi trường app gọi).
 
 ## Exam Tips
 - Câu hỏi "workflow hay agent": tìm tín hiệu **"enumerate được các bước / input well-constrained / cùng 1 sequence mỗi lần"** → **workflow**. "Goal + tools nhưng không định được path / input biến thiên" → **agent**.
@@ -149,6 +226,10 @@ cụ thể + attach credential + config region + emit log** → phải **nêu t�
 - **Compliance constraint chọn endpoint + credential TRƯỚC** mọi quyết định prompt/tool/memory.
 - HITL: chèn ở đâu = trả lời câu *"worst-case nếu step này chạy không có human check?"* → destructive call = High = chèn trước.
 - Progression: **1 API call → workflow → agent**. Agent là bậc cuối.
+- **Memory scope**: "agent giúp user qua nhiều ngày / nhiều session" → keyword đáp án đúng: **external storage / persistent store / summarized memory**; đáp án sai: "tăng context window", "giữ full history trong `messages`". "Agent nhận 1 task làm xong đóng" → **stateless**.
+- "Khi nào quyết memory scope?" → **design phase** (rẻ), không phải production refactor (đắt vì timing).
+- **Skill vs CLAUDE.md**: đề nói "instruction chỉ dùng cho 1 loại task cụ thể, đừng làm nặng session khác" → **Skill**. "Chuẩn áp dụng cho MỌI task trong repo" → **CLAUDE.md**.
+- Nhớ 2 beta header Skills + fact "subagent inherit **permission** nhưng **không** inherit Skills/history".
 
 ## Code Snippets
 ```python
@@ -178,9 +259,42 @@ for turn in range(MAX_TURNS):                 # exit (b): hard cap, không để
     messages.append({"role": "user", "content": results})
 ```
 
+```python
+# 4 memory scope — cùng 1 agent, khác nhau ở "state nào sống sau khi session kết thúc"
+
+# (1) STATELESS — không load gì, không lưu gì. Mỗi call độc lập.
+def run_stateless(user_msg):
+    return client.messages.create(model=MODEL, max_tokens=400,
+                                  messages=[{"role": "user", "content": user_msg}])
+
+# (2) IN-CONTEXT — history sống trong list `messages`, chỉ trong 1 lần chạy process.
+messages = []                                  # session mới => list rỗng => mất sạch history cũ
+messages.append({"role": "user", "content": user_msg})
+# ... gọi API, append assistant ... token cost tăng dần mỗi turn
+
+# (3) EXTERNAL STORAGE — ghi/đọc history ra file (đại diện cho DB) => sống qua session.
+import json, pathlib
+STORE = pathlib.Path("session_state.json")
+history = json.loads(STORE.read_text()) if STORE.exists() else []   # đọc lại lúc start (thêm latency)
+history.append({"role": "user", "content": user_msg})
+# ... gọi API với messages=history ...
+STORE.write_text(json.dumps(history))          # ghi lại (bạn tự viết read/write logic)
+
+# (4) SUMMARIZED — nén history cũ thành 1 đoạn tóm tắt, inject đầu session sau.
+summary = client.messages.create(              # chi tiết nào summarizer prompt bỏ => mất luôn
+    model=MODEL, max_tokens=300,
+    messages=[{"role": "user",
+               "content": f"Tóm tắt hội thoại sau, GIỮ mọi quyết định + ràng buộc:\n{old_history}"}],
+).content[0].text
+next_session_messages = [{"role": "user", "content": f"[Bối cảnh phiên trước]\n{summary}"}]
+```
+
 ## Questions / Unclear Points
 - Manager/supervisor hierarchies + multi-agent (planner / executor / evaluator handoff qua structured
   artifact) — blueprint có, lesson này chưa dạy.
 - Subagent memory / handoff artifact format cụ thể.
+- Cơ chế compaction / prompt caching cụ thể để giảm cost khi buộc phải giữ in-context lâu (Domain 06).
+- Cú pháp `settingSources` chính xác trong Agent SDK + default hiện hành — cần verify tại build time.
+- Skills trên Messages API: tool/filesystem access thực tế trong code execution container gồm những gì.
 - Agentic frameworks: Strands, LangGraph, PydanticAI — khác nhau thế nào, khi nào chọn cái nào.
 - Hooks cho deterministic actions trong Agent SDK — cơ chế, insertion point.
