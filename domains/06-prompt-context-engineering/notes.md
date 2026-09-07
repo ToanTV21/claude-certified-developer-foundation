@@ -397,6 +397,10 @@ tool output to ra, session dài ra, window từng giữ 20 turn gọn giờ đ�
 postmortem của 1 agent chạy ổn trên test fixture rồi chạm trần khi document thật chảy qua.
 
 ### Building a production agent — the loop, wiring paths, orchestration, HITL
+> Chủ đề này thuộc blueprint **domain 01 (Agents and Workflows, 14.7%)** — bản đầy đủ + exercise
+> wiring-path ở [domain 01 notes](../01-agents-and-workflows/notes.md). Giữ bản tóm ở đây vì
+> context engineering cũng chạm (context budget của agent loop).
+
 - **Agent = 1 multi-step tool-use loop** có **managed context** + **defined goal**. Các mảnh rời (tool
   schema, context management) đã học ở trên — section này **ghép chúng thành 1 hệ chạy được** và thêm
   lớp mà 2 topic kia không tự có (orchestration + human-in-the-loop).
